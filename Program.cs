@@ -183,7 +183,7 @@ class BuscaPrecoServer
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Erro ao enviar #live?: {ex.Message}");
+                _logger.LogError($"Erro ao enviar #alwayslive: {ex.Message}");
             }
         }, null, 0, 15000))
         {
@@ -198,9 +198,9 @@ class BuscaPrecoServer
 
                         if (comando.StartsWith("#") && comando.Length > 1)
                         {
-                            if (comando == "#live")
+                            if (comando == "#alwayslive_ok")
                             {
-                                _logger.LogInformation("Recebido #live do terminal.");
+                                _logger.LogInformation("Recebido #alwayslive_ok do terminal.");
                                 continue;
                             }
 
