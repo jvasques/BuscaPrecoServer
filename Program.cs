@@ -11,18 +11,37 @@ using System.Globalization;
 using System.Windows.Forms;
 using System.Drawing;
 using Microsoft.Extensions.Logging;
+using System.Reflection;
+using System.Linq;
+
+class ConsultaProduto
+{
+    public string CodigoBarras { get; set; }
+    public string Descricao { get; set; }
+    public string Preco { get; set; }
+    public DateTime DataHora { get; set; }
+
+    public ConsultaProduto(string codigoBarras, string descricao, string preco, DateTime dataHora)
+    {
+        CodigoBarras = codigoBarras;
+        Descricao = descricao ?? "Não encontrado";
+        Preco = preco ?? "N/A";
+        DataHora = dataHora;
+    }
+}
 
 class BuscaPrecoServer
 {
     private static int PORT = 6500;
-    private static string DATA_FILE = "produtos.txt";
+    public static string DATA_FILE = "produtos.txt";
     private static string CONFIG_FILE = "config.ini";
-    private static int UPDATE_INTERVAL_MINUTES = 1; // Padrão: 1 minuto
+    private static int UPDATE_INTERVAL_MINUTES = 1;
     private static Dictionary<string, string> produtos = new Dictionary<string, string>();
     private static DateTime ultimaModificacao = DateTime.MinValue;
     private readonly ILogger<BuscaPrecoServer> _logger;
     private static readonly string LogDuplicatesPath = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, "LogDuplicates.txt");
     private CancellationTokenSource _cts = new CancellationTokenSource();
+    private static readonly List<ConsultaProduto> consultasRealizadas = new List<ConsultaProduto>();
 
     public BuscaPrecoServer(ILogger<BuscaPrecoServer> logger)
     {
@@ -183,7 +202,7 @@ class BuscaPrecoServer
             }
             catch (Exception ex)
             {
-                _logger.LogError($"Erro ao enviar #alwayslive: {ex.Message}");
+                _logger.LogError($"Erro ao enviar #live?: {ex.Message}");
             }
         }, null, 0, 15000))
         {
@@ -198,31 +217,47 @@ class BuscaPrecoServer
 
                         if (comando.StartsWith("#") && comando.Length > 1)
                         {
-                            if (comando == "#alwayslive_ok")
+                            if (comando == "#live")
                             {
-                                _logger.LogInformation("Recebido #alwayslive_ok do terminal.");
+                                _logger.LogInformation("Recebido #live do terminal.");
                                 continue;
                             }
 
                             string codigoBarras = Regex.Replace(comando.Substring(1), "[^0-9]", "");
+                            if (string.IsNullOrWhiteSpace(codigoBarras))
+                            {
+                                continue;
+                            }
+
+                            _logger.LogInformation($"Consulta TCP recebida: {codigoBarras}");
+
                             lock (produtos)
                             {
                                 string resposta;
+                                string descricao = null;
+                                string preco = null;
+                                DateTime dataHora = DateTime.Now;
                                 if (produtos.ContainsKey(codigoBarras))
                                 {
                                     string[] partes = produtos[codigoBarras].Substring(1).Split('|');
-                                    string nome = partes[0];
-                                    string preco = partes[1].Trim();
-                                    resposta = $"#{nome}|R$ {preco}";
+                                    descricao = partes[0];
+                                    preco = partes[1].Trim();
+                                    resposta = $"#{descricao}|R$ {preco}";
                                 }
                                 else
                                 {
                                     resposta = "#nfound";
                                 }
 
+                                lock (consultasRealizadas)
+                                {
+                                    consultasRealizadas.Add(new ConsultaProduto(codigoBarras, descricao, preco, dataHora));
+                                }
+
                                 byte[] respostaBytes = Encoding.ASCII.GetBytes(resposta);
                                 stream.Write(respostaBytes, 0, respostaBytes.Length);
                                 stream.Flush();
+                                _logger.LogInformation($"Resposta TCP enviada: {resposta}");
                             }
                         }
                     }
@@ -247,8 +282,22 @@ class BuscaPrecoServer
             lock (produtos)
             {
                 string respostaTCP = produtos.ContainsKey(codigoBarras) ? produtos[codigoBarras] : "#nfound";
-                string respostaHTTP = ConverterParaFormatoHTTP(respostaTCP);
+                string descricao = null;
+                string preco = null;
+                DateTime dataHora = DateTime.Now;
+                if (produtos.ContainsKey(codigoBarras))
+                {
+                    string[] partes = respostaTCP.Substring(1).Split('|');
+                    descricao = partes[0];
+                    preco = partes[1].Trim();
+                }
 
+                lock (consultasRealizadas)
+                {
+                    consultasRealizadas.Add(new ConsultaProduto(codigoBarras, descricao, preco, dataHora));
+                }
+
+                string respostaHTTP = ConverterParaFormatoHTTP(respostaTCP);
                 string httpResponse = "HTTP/1.1 200 OK\r\n" +
                                      "Content-Type: text/html\r\n" +
                                      $"Content-Length: {respostaHTTP.Length}\r\n" +
@@ -292,7 +341,7 @@ class BuscaPrecoServer
         }
     }
 
-    private void CarregarProdutos()
+    public void CarregarProdutos()
     {
         try
         {
@@ -344,16 +393,93 @@ class BuscaPrecoServer
                     ultimaModificacao = File.GetLastWriteTime(DATA_FILE);
                 }
 
+                string produtosLocalPath = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, "produtos.txt");
+                using (var writer = new StreamWriter(produtosLocalPath))
+                {
+                    foreach (var item in novosProdutos)
+                    {
+                        string[] partes = item.Value.Substring(1).Split('|');
+                        writer.WriteLine($"{item.Key}|{partes[0]}|{partes[1]}");
+                    }
+                }
+                _logger.LogInformation($"produtos.txt atualizado com {novosProdutos.Count} produtos em: {produtosLocalPath}");
+
                 _logger.LogInformation($"Produtos carregados: {novosProdutos.Count} (Última modificação: {ultimaModificacao})");
             }
             else
             {
-                _logger.LogWarning($"Arquivo {DATA_FILE} não encontrado.");
+                _logger.LogWarning($"Arquivo {DATA_FILE} não encontrado. Tentando carregar produtos.txt local.");
+                string produtosLocalPath = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, "produtos.txt");
+                if (File.Exists(produtosLocalPath))
+                {
+                    CarregarProdutosDeFallback(produtosLocalPath);
+                }
+                else
+                {
+                    _logger.LogWarning($"Arquivo local {produtosLocalPath} também não encontrado.");
+                }
             }
         }
         catch (Exception e)
         {
             _logger.LogError($"Erro ao carregar arquivo de produtos: {e.Message}");
+        }
+    }
+
+    private void CarregarProdutosDeFallback(string caminho)
+    {
+        try
+        {
+            string[] linhas = File.ReadAllLines(caminho);
+            var novosProdutos = new Dictionary<string, string>();
+
+            foreach (string linha in linhas)
+            {
+                string[] partes = linha.Split('|');
+                if (partes.Length == 3)
+                {
+                    string codigo = partes[0].Trim();
+                    string nome = partes[1].Trim();
+                    string precoStr = partes[2].Trim();
+
+                    if (string.Equals(codigo, "SEM GTIN", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogWarning($"Produto com código 'SEM GTIN' ignorado: '{nome}|{precoStr}'.");
+                        continue;
+                    }
+
+                    string produto = $"#{nome}|{precoStr}";
+                    if (decimal.TryParse(precoStr, NumberStyles.Any, CultureInfo.GetCultureInfo("pt-BR"), out decimal precoDecimal))
+                    {
+                        string preco = precoDecimal.ToString("N2", CultureInfo.GetCultureInfo("pt-BR"));
+                        produto = $"#{nome}|{preco}";
+                    }
+
+                    if (novosProdutos.ContainsKey(codigo))
+                    {
+                        string logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Código: {codigo} - Substituído: '{novosProdutos[codigo]}' por '{produto}'";
+                        File.AppendAllText(LogDuplicatesPath, logMessage + Environment.NewLine);
+                        _logger.LogWarning($"Código duplicado encontrado: {codigo}. Registrado em LogDuplicates.txt.");
+                    }
+                    novosProdutos[codigo] = produto;
+                }
+            }
+
+            lock (produtos)
+            {
+                produtos.Clear();
+                foreach (var item in novosProdutos)
+                {
+                    produtos[item.Key] = item.Value;
+                }
+                ultimaModificacao = File.GetLastWriteTime(caminho);
+            }
+
+            _logger.LogInformation($"Produtos carregados do fallback: {novosProdutos.Count} (Última modificação: {ultimaModificacao})");
+        }
+        catch (Exception e)
+        {
+            _logger.LogError($"Erro ao carregar produtos do fallback {caminho}: {e.Message}");
         }
     }
 
@@ -388,14 +514,53 @@ class BuscaPrecoServer
             _logger.LogError($"Erro ao verificar alterações no arquivo: {e.Message}");
         }
     }
+
+    public static (List<(string CodigoBarras, string Descricao, string Preco, int Quantidade)> Consultas, DateTime? DataInicio, DateTime? DataFim) GetConsultasAgrupadas()
+    {
+        lock (consultasRealizadas)
+        {
+            if (consultasRealizadas.Count == 0)
+            {
+                return (new List<(string, string, string, int)>(), null, null);
+            }
+
+            var agrupadas = consultasRealizadas
+                .GroupBy(c => c.CodigoBarras)
+                .Select(g => (
+                    CodigoBarras: g.Key,
+                    Descricao: g.First().Descricao,
+                    Preco: g.First().Preco,
+                    Quantidade: g.Count()
+                ))
+                .ToList();
+
+            var dataInicio = consultasRealizadas.Min(c => c.DataHora);
+            var dataFim = consultasRealizadas.Max(c => c.DataHora);
+
+            return (agrupadas, dataInicio, dataFim);
+        }
+    }
 }
 
 class LogForm : Form
 {
     private TextBox _logTextBox;
+    private Button _exportButton;
+    private Button _forceUpdateButton;
     private bool _isInitialized = false;
+    private BuscaPrecoServer _server; // Mudança para não readonly, permitindo atualização
 
-    public LogForm()
+    public LogForm() // Construtor sem parâmetros para inicialização inicial
+    {
+        InitializeComponents();
+    }
+
+    public void SetServer(BuscaPrecoServer server) // Método para definir o servidor posteriormente
+    {
+        _server = server;
+    }
+
+    private void InitializeComponents()
     {
         Text = "Busca Preço Server - Logs";
         Size = new Size(600, 400);
@@ -403,8 +568,38 @@ class LogForm : Form
         MinimizeBox = true;
         MaximizeBox = false;
 
-        string exeDir = Path.GetDirectoryName(Environment.ProcessPath);
-        Icon = new Icon(Path.Combine(exeDir ?? AppContext.BaseDirectory, "barcodeOn.ico"));
+        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("BuscaPrecoServer.barcodeOn.ico"))
+        {
+            if (stream != null)
+            {
+                Icon = new Icon(stream);
+            }
+        }
+
+        var panel = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 35
+        };
+
+        _exportButton = new Button
+        {
+            Text = "Exportar Consultas",
+            Location = new Point(10, 5),
+            Size = new Size(120, 25)
+        };
+        _exportButton.Click += ExportButton_Click;
+
+        _forceUpdateButton = new Button
+        {
+            Text = "Forçar Atualização",
+            Location = new Point(140, 5),
+            Size = new Size(120, 25)
+        };
+        _forceUpdateButton.Click += ForceUpdateButton_Click;
+
+        panel.Controls.Add(_exportButton);
+        panel.Controls.Add(_forceUpdateButton);
 
         _logTextBox = new TextBox
         {
@@ -416,7 +611,61 @@ class LogForm : Form
         };
 
         Controls.Add(_logTextBox);
+        Controls.Add(panel);
         Load += (s, e) => _isInitialized = true;
+    }
+
+    private void ExportButton_Click(object sender, EventArgs e)
+    {
+        try
+        {
+            var (consultasAgrupadas, dataInicio, dataFim) = BuscaPrecoServer.GetConsultasAgrupadas();
+            if (consultasAgrupadas.Count == 0)
+            {
+                MessageBox.Show("Nenhuma consulta registrada.", "Exportar Consultas", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            string exportPath = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, $"Consultas_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+            using (var writer = new StreamWriter(exportPath))
+            {
+                writer.WriteLine($"Relatório de Consultas - Gerado em: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                writer.WriteLine($"Consultas realizadas de {dataInicio:dd/MM/yyyy HH:mm:ss} até {dataFim:dd/MM/yyyy HH:mm:ss}");
+                writer.WriteLine("Código de Barras | Descrição | Preço | Quantidade de Consultas");
+                writer.WriteLine("---------------------------------------------------------------");
+                foreach (var consulta in consultasAgrupadas.OrderByDescending(c => c.Quantidade))
+                {
+                    writer.WriteLine($"{consulta.CodigoBarras} | {consulta.Descricao} | {consulta.Preco} | {consulta.Quantidade}");
+                }
+                writer.WriteLine($"Total de consultas únicas: {consultasAgrupadas.Count}");
+                writer.WriteLine($"Total de consultas realizadas: {consultasAgrupadas.Sum(c => c.Quantidade)}");
+            }
+
+            MessageBox.Show($"Consultas exportadas com sucesso para: {exportPath}", "Exportar Consultas", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Erro ao exportar consultas: {ex.Message}", "Erro", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void ForceUpdateButton_Click(object sender, EventArgs e)
+    {
+        if (_server == null)
+        {
+            MessageBox.Show("Servidor não inicializado ainda.", "Erro", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        try
+        {
+            _server.CarregarProdutos();
+            MessageBox.Show("Atualização dos produtos forçada com sucesso.", "Forçar Atualização", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Erro ao forçar atualização: {ex.Message}", "Erro", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     public void AppendLog(string message)
@@ -483,13 +732,13 @@ class TextBoxLogger : ILogger
             message += $"\nException: {exception}";
 
         Console.WriteLine(message);
-        _logForm.AppendLog(message);
+        _logForm?.AppendLog(message); // Verificação de nulidade
     }
 }
 
 class Program6
 {
-    private static BuscaPrecoServer _server; // Corrigido para tipo completo
+    private static BuscaPrecoServer _server;
     private static NotifyIcon _notifyIcon;
     private static LogForm _logForm;
     private static System.Threading.Timer _iconTimer;
@@ -502,10 +751,10 @@ class Program6
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        // Criar o LogForm primeiro
         _logForm = new LogForm();
-        _logForm.Show();
-        _logForm.Hide();
 
+        // Configurar o logger com o LogForm
         var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder.AddConsole();
@@ -514,14 +763,31 @@ class Program6
         });
         ILogger<BuscaPrecoServer> logger = loggerFactory.CreateLogger<BuscaPrecoServer>();
 
+        // Criar o servidor
         _server = new BuscaPrecoServer(logger);
 
-        string exeDir = Path.GetDirectoryName(Environment.ProcessPath);
-        _icons = new Icon[]
+        // Definir o servidor no LogForm
+        _logForm.SetServer(_server);
+
+        // Exibir e ocultar o LogForm
+        _logForm.Show();
+        _logForm.Hide();
+
+        _icons = new Icon[2];
+        using (var onStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("BuscaPrecoServer.barcodeOn.ico"))
+        using (var offStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("BuscaPrecoServer.barcodeOff.ico"))
         {
-            new Icon(Path.Combine(exeDir ?? AppContext.BaseDirectory, "barcodeOn.ico")),
-            new Icon(Path.Combine(exeDir ?? AppContext.BaseDirectory, "barcodeOff.ico"))
-        };
+            if (onStream != null && offStream != null)
+            {
+                _icons[0] = new Icon(onStream);
+                _icons[1] = new Icon(offStream);
+            }
+            else
+            {
+                _icons[0] = SystemIcons.Application;
+                _icons[1] = SystemIcons.Application;
+            }
+        }
 
         _notifyIcon = new NotifyIcon
         {
@@ -565,6 +831,11 @@ class Program6
         _server.Stop();
         _iconTimer.Dispose();
         _notifyIcon.Visible = false;
+        foreach (var icon in _icons)
+        {
+            icon.Dispose();
+        }
+        _notifyIcon.Dispose();
         _logForm.Close();
         Application.Exit();
     }
